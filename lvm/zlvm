@@ -1,0 +1,141 @@
+#!/bin/bash
+# Zabbix LVM pool monitoring script
+# https://github.com/MediaServe/zabbix-templates
+# MediaServe International B.V.
+# Thomas Lobker
+
+help () {
+	if [ ${#} -eq 1 ]; then
+		echo "ERROR: ${1}" 1>&2
+		exit 1
+	fi
+
+	echo "Usage: zlvm (-d [type]) | (-s|-u|-m [path])"
+	echo "Requires one method with one argument, output will be JSON for discovery or a float for other values"
+	echo
+	echo "  -d [type]      Discovery of available paths of the specified 'type'"
+	echo
+	echo "                 group: for a list of available logical volume groups"
+	echo "                 pool: for a list of available pools in all logical volume groups"
+	echo "                 volume: for a list of all available logical volumes"
+	echo
+	echo "  -s [path]      Get the total size of the specified 'path'"
+	echo "  -u [path]      Get the total usage (in percent) of the specified 'path'"
+	echo "  -m [path]      Get the total usage (in percent) of metadata of the specified 'path'"
+	echo
+	echo "                 Path of group, pool or logical volume: group[/pool[/volume]]"
+	echo "                 Example: vg0/lvol1/lv0"
+	echo
+	echo "Examples:"
+	echo "  zlvm -d pool"
+	echo "  zlvm -s vg0/pool1"
+
+	exit 1
+}
+
+trim () {
+	local value="$*"
+	value="${value#"${value%%[![:space:]]*}"}"
+	echo "${value%"${value##*[![:space:]]}"}"
+}
+
+discovery () {
+	case ${1} in
+		"group")
+			# FILTER="[ { \"{#ZLVM_GROUP}\": .[\"report\"][0][\"vg\"][].vg_name } ]"
+			FILTER="[(.[\"report\"][0][\"vg\"][] | { \"{#ZLVM_GROUP}\": .vg_name })]"
+			value=$( ${VGS} --nosuffix --units b --reportformat json -o vg_name | ${JQ} -Mca "${FILTER}" )
+			trim "${value}"
+			exit 0 ;;
+		"pool")
+			# FILTER="{data: [(.[\"report\"][0][\"lv\"][] | select(.\"pool_lv\" == \"\"))]}"
+			FILTER="[(.[\"report\"][0][\"lv\"][] | select(.\"pool_lv\" == \"\") | { \"{#ZLVM_GROUP}\": .vg_name, \"{#ZLVM_POOL}\": .lv_name })]"
+			value=$( ${LVS} --nosuffix --units b --reportformat json -o lv_name,vg_name,pool_lv | ${JQ} -Mca "${FILTER}" )
+			trim "${value}"
+			exit 0 ;;
+		"volume")
+			# FILTER="{data: [(.[\"report\"][0][\"lv\"][] | select((.\"pool_lv\" != \"\")))]}"
+			FILTER="[(.[\"report\"][0][\"lv\"][] | select(.\"pool_lv\" != \"\") | { \"{#ZLVM_GROUP}\": .vg_name, \"{#ZLVM_POOL}\": .pool_lv, \"{#ZLVM_VOLUME}\": .lv_name })]"
+			value=$( ${LVS} --nosuffix --units b --reportformat json -o lv_name,vg_name,pool_lv | ${JQ} -Mca "${FILTER}" )
+			trim "${value}"
+			exit 0 ;;
+	esac
+
+	help "No valid discovery type specified"
+}
+
+status () {
+	if [ ${#} -eq 2 ]; then
+		while IFS='/' read -ra PATH; do
+			case ${#PATH[@]} in
+				1)
+					case "${2}" in
+						"size") options="vg_size" ;;
+					esac
+
+					value=$( ${VGS} --no-headings --nosuffix --units b --select "vg_name = ${PATH[0]}" -o "${options}" )
+					trim "${value}"
+					exit 0 ;;
+				2)
+					case "${2}" in
+						"size") options="lv_size" ;;
+						"usage") options="data_percent" ;;
+						"metadata") options="metadata_percent" ;;
+					esac
+
+					value=$( ${LVS} --no-headings --nosuffix --units b --select "vg_name = ${PATH[0]} && lv_name = ${PATH[1]}" -o "${options}" )
+					trim "${value}"
+					exit 0 ;;
+				3)
+					case "${2}" in
+						"size") options="lv_size" ;;
+						"usage") options="data_percent" ;;
+					esac
+
+					value=$( ${LVS} --no-headings --nosuffix --units b --select "vg_name = ${PATH[0]} && pool_lv = ${PATH[1]} && lv_name = ${PATH[2]}" -o "${options}" )
+					trim "${value}"
+					exit 0 ;;
+			esac
+		done <<< "${1}"
+
+		help "No valid logical volume path specified"
+	fi
+}
+
+LVS=`which lvs`
+VGS=`which vgs`
+
+# Check if LVM tools is installed
+if [ ! -x "${LVS}" ] || [ ! -x "${VGS}" ]; then
+	help "Unable to execute LVM tools, please install the 'lvm2' package first"
+fi
+
+JQ=`which jq`
+
+# Check if JQ is installed
+if [ ! -x "${JQ}" ]; then
+	help "Unable to execute JSON processor, please install the 'jq' package first"
+fi
+
+# Check if the program is running with root privileges
+if [ ${EUID} -ne 0 ]; then
+	help "LVM tools requires root privileges"
+fi
+
+# Check if the user provided two arguments
+if [ ${#} -lt 2 ]; then
+	help
+fi
+
+# Check the command line arguments
+while getopts ":d:s:u:m:" opt; do
+	case ${opt} in
+		d) discovery "${OPTARG}" ;;
+		s) status "${OPTARG}" "size" ;;
+		u) status "${OPTARG}" "usage" ;;
+		m) status "${OPTARG}" "metadata" ;;
+	esac
+done
+
+# Display usage information and exit
+help
